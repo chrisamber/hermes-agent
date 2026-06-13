@@ -1,0 +1,130 @@
+name: Sync upstream (NousResearch)
+
+# Keeps this fork up to date with NousResearch/hermes-agent WITHOUT losing the
+# Railway data-persistence patch. This fork's only delta vs upstream is removing
+# the `VOLUME` instruction from the Dockerfile so Railway's persistent volume
+# mounted at /opt/data (HERMES_HOME) actually retains user data across deploys.
+#
+# PR-gated: this never deploys anything. It opens a PR into `main`; merging that
+# PR is what triggers the Railway production deploy. See docs/RAILWAY_UPSTREAM_SYNC.md.
+
+on:
+  schedule:
+    - cron: "17 6 * * *" # daily, 06:17 UTC
+  workflow_dispatch: {} # allow manual runs from the Actions tab
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/NousResearch/hermes-agent.git
+  UPSTREAM_BRANCH: main
+  SYNC_BRANCH: sync/upstream
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "hermes-sync-bot"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null || git remote set-url upstream "$UPSTREAM_URL"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+
+      - name: Determine if behind upstream
+        id: gap
+        run: |
+          BEHIND=$(git rev-list --count "origin/main..upstream/${UPSTREAM_BRANCH}")
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          echo "Fork is behind upstream by $BEHIND commits."
+
+      - name: Replay fork patches onto upstream
+        if: steps.gap.outputs.behind != '0'
+        run: |
+          MB=$(git merge-base "upstream/${UPSTREAM_BRANCH}" origin/main)
+          echo "Merge base with upstream: $MB"
+          # Replay only the real (non-merge) patch commits that this fork adds.
+          mapfile -t PATCHES < <(git rev-list --reverse --no-merges "${MB}..origin/main")
+          echo "Patch commits to replay: ${PATCHES[*]:-<none>}"
+          git checkout -B "$SYNC_BRANCH" "upstream/${UPSTREAM_BRANCH}"
+          if [ "${#PATCHES[@]}" -gt 0 ]; then
+            if ! git cherry-pick "${PATCHES[@]}"; then
+              git cherry-pick --abort || true
+              echo "::error::Could not replay the fork's patch onto upstream (Dockerfile conflict). Resolve manually."
+              exit 1
+            fi
+          fi
+
+      - name: Guard - reject reintroduced VOLUME directive
+        if: steps.gap.outputs.behind != '0'
+        run: |
+          if grep -nE '^[[:space:]]*VOLUME\b' Dockerfile; then
+            echo "::error::Dockerfile has a VOLUME directive after sync. This shadows the Railway /opt/data volume and user data will appear empty after deploy. Aborting before opening a PR."
+            exit 1
+          fi
+          echo "OK: no VOLUME directive in Dockerfile."
+
+      - name: Push sync branch
+        if: steps.gap.outputs.behind != '0'
+        run: git push --force-with-lease origin "$SYNC_BRANCH"
+
+      - name: Open or update PR
+        if: steps.gap.outputs.behind != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TITLE="Sync upstream -> main (${{ steps.gap.outputs.behind }} commits behind)"
+          {
+            echo "Automated upstream sync from NousResearch/hermes-agent@main."
+            echo ""
+            echo "This branch is upstream/main with this fork's Railway patch replayed on top"
+            echo "(removes the VOLUME instruction so the /opt/data persistent volume keeps user data)."
+            echo ""
+            echo "Before merging, confirm:"
+            echo "- [ ] This run's VOLUME guard passed (it did, or this PR would not exist)."
+            echo "- [ ] Dockerfile still has NO VOLUME directive at /opt/data."
+            echo "- [ ] HERMES_HOME=/opt/data is unchanged."
+            echo ""
+            echo "Merge with 'Create a merge commit'. Merging triggers the Railway production deploy;"
+            echo "the /opt/data volume persists across deploys. See docs/RAILWAY_UPSTREAM_SYNC.md."
+          } > pr_body.md
+          if gh pr view "$SYNC_BRANCH" --json number >/dev/null 2>&1; then
+            gh pr edit "$SYNC_BRANCH" --title "$TITLE" --body-file pr_body.md
+          else
+            gh pr create --base main --head "$SYNC_BRANCH" --title "$TITLE" --body-file pr_body.md
+          fi
+
+      - name: Notify on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TITLE="Upstream sync needs manual attention"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          {
+            echo "The scheduled upstream sync failed: $RUN_URL"
+            echo ""
+            echo "Likely a Dockerfile conflict while replaying the patch, or a reintroduced VOLUME directive."
+            echo "Resolve manually following docs/RAILWAY_UPSTREAM_SYNC.md (keep /opt/data persistence rules)."
+          } > issue_body.md
+          EXISTING=$(gh issue list --state open --search "Upstream sync needs manual attention in:title" --json number --jq '.[0].number' 2>/dev/null || echo "")
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body-file issue_body.md
+          else
+            gh issue create --title "$TITLE" --body-file issue_body.md
+          fi
